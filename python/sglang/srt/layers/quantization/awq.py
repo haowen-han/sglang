@@ -557,39 +557,59 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         layer.qzeros = torch.nn.Parameter(layer.qzeros.data, requires_grad=False)
         layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
 
-        # Allocate marlin workspace
-        layer.workspace = marlin_make_workspace(device)
+        is_blackwell = _is_cuda and torch.cuda.get_device_capability(device)[0] >= 10
 
-        # Repack weights from AWQ format to marlin format.
-        marlin_qweight = awq_marlin_repack(
-            layer.qweight,
-            size_k=layer.input_size_per_partition,
-            size_n=layer.output_size_per_partition,
-            num_bits=self.quant_config.quant_type.size_bits,
-        )
-        replace_parameter(layer, "qweight", marlin_qweight)
+        if is_blackwell:
+            # Blackwell: transpose to K-contiguous layout, keep AWQ interleave packing
+            qweight = layer.qweight.data.t().contiguous().t()
+            replace_parameter(layer, "qweight", qweight)
 
-        # Permute scales from AWQ format to marlin format.
-        marlin_scales = marlin_permute_scales(
-            layer.scales,
-            size_k=layer.input_size_per_partition,
-            size_n=layer.output_size_per_partition,
-            group_size=self.quant_config.group_size,
-        )
-        replace_parameter(layer, "scales", marlin_scales)
+            # scales: [G, N] bf16, row-major → [G, N] bf16, stride (1, G)
+            scales = layer.scales.data.t().contiguous().t()
+            replace_parameter(layer, "scales", scales)
 
-        # Permute zero-points from AWQ format to marlin format.
-        marlin_zp = awq_to_marlin_zero_points(
-            layer.qzeros,
-            size_k=layer.num_groups,
-            size_n=layer.output_size_per_partition,
-            num_bits=self.quant_config.quant_type.size_bits,
-        )
-        replace_parameter(layer, "qzeros", marlin_zp)
+            # qzeros: [G, N/8] int32, row-major, AWQ interleave
+            #   → [G, N/8] int32, stride (1, G), keep AWQ interleave packing
+            qzeros = layer.qzeros.data.t().contiguous().t()
+            replace_parameter(layer, "qzeros", qzeros)
 
-        # Not-used
-        layer.g_idx = marlin_make_empty_g_idx(device)
-        layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
+            layer.workspace = torch.empty(0, dtype=torch.int32, device=device)
+            layer.g_idx = marlin_make_empty_g_idx(device)
+            layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
+        else:
+            # Original Marlin path
+            layer.workspace = marlin_make_workspace(device)
+
+            # Repack weights from AWQ format to marlin format.
+            marlin_qweight = awq_marlin_repack(
+                layer.qweight,
+                size_k=layer.input_size_per_partition,
+                size_n=layer.output_size_per_partition,
+                num_bits=self.quant_config.quant_type.size_bits,
+            )
+            replace_parameter(layer, "qweight", marlin_qweight)
+
+            # Permute scales from AWQ format to marlin format.
+            marlin_scales = marlin_permute_scales(
+                layer.scales,
+                size_k=layer.input_size_per_partition,
+                size_n=layer.output_size_per_partition,
+                group_size=self.quant_config.group_size,
+            )
+            replace_parameter(layer, "scales", marlin_scales)
+
+            # Permute zero-points from AWQ format to marlin format.
+            marlin_zp = awq_to_marlin_zero_points(
+                layer.qzeros,
+                size_k=layer.num_groups,
+                size_n=layer.output_size_per_partition,
+                num_bits=self.quant_config.quant_type.size_bits,
+            )
+            replace_parameter(layer, "qzeros", marlin_zp)
+
+            # Not-used
+            layer.g_idx = marlin_make_empty_g_idx(device)
+            layer.g_idx_sort_indices = marlin_make_empty_g_idx(device)
 
     def apply(
         self,
@@ -597,19 +617,41 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return apply_awq_marlin_linear(
-            input=x,
-            weight=layer.qweight,
-            weight_scale=layer.scales,
-            weight_zp=layer.qzeros,
-            g_idx=layer.g_idx,
-            g_idx_sort_indices=layer.g_idx_sort_indices,
-            workspace=layer.workspace,
-            quant_type=self.quant_config.quant_type,
-            output_size_per_partition=layer.output_size_per_partition,
-            input_size_per_partition=layer.input_size_per_partition,
-            bias=bias,
-        )
+        is_blackwell = _is_cuda and torch.cuda.get_device_capability(x.device)[0] >= 10
+
+        if is_blackwell:
+            from sglang.srt.layers.quantization.awq_blackwell_triton import (
+                blackwell_awq_gemm,
+            )
+
+            reshaped_x = x.reshape(-1, x.shape[-1])
+            out = blackwell_awq_gemm(
+                a=reshaped_x,
+                b_qweight=layer.qweight,
+                scales=layer.scales,
+                zeros=layer.qzeros,
+                M=reshaped_x.shape[0],
+                N=layer.output_size_per_partition,
+                K=layer.input_size_per_partition,
+                group_size=self.quant_config.group_size,
+            )
+            if bias is not None:
+                out.add_(bias)
+            return out.reshape(x.shape[:-1] + (layer.output_size_per_partition,))
+        else:
+            return apply_awq_marlin_linear(
+                input=x,
+                weight=layer.qweight,
+                weight_scale=layer.scales,
+                weight_zp=layer.qzeros,
+                g_idx=layer.g_idx,
+                g_idx_sort_indices=layer.g_idx_sort_indices,
+                workspace=layer.workspace,
+                quant_type=self.quant_config.quant_type,
+                output_size_per_partition=layer.output_size_per_partition,
+                input_size_per_partition=layer.input_size_per_partition,
+                bias=bias,
+            )
 
 
 class AWQLinearAscendMethod(AWQLinearMethod):
